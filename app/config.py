@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     GITHUB_WEBHOOK_SECRET: str = ""
     GITHUB_APP_ID:         str = ""
     GITHUB_PRIVATE_KEY:    str = ""
+    GITHUB_TOKEN:          str = ""
+    GITHUB_API_VERSION:    str = "2022-11-28"
 
     # ── LangSmith ─────────────────────────────────────────────────────────
     LANGCHAIN_TRACING_V2: bool = False
@@ -65,7 +67,10 @@ class Settings(BaseSettings):
     # ── Ingestion settings ────────────────────────────────────────────────
     CHUNK_MAX_LINES:     int   = 80    # max lines per code chunk
     EMBEDDING_DIMENSION: int   = 768   # nomic-embed-text dimension
-                                       # change to 1536 for Azure embeddings
+                                    # change to 1536 for Azure embeddings
+
+    # ── Ingestion versioning ───────────────────────────────────────────
+    CHUNKING_VERSION: str = "1.0"
 
     # ── Retrieval settings ────────────────────────────────────────────────
     RETRIEVAL_TOP_K:       int   = 10    # how many chunks to retrieve per query
@@ -90,6 +95,17 @@ class Settings(BaseSettings):
     def is_azure(self) -> bool:
         return self.LLM_PROVIDER == LLMProvider.AZURE
 
+    @property
+    def active_embedding_model(self) -> str:
+        """Unified embedding model name regardless of provider."""
+        if self.is_ollama:
+            return self.OLLAMA_EMBED_MODEL
+        return self.AZURE_EMBED_DEPLOYMENT
+
+    @property
+    def parser_version(self) -> str:
+        from importlib.metadata import version
+        return version("tree-sitter")
 
 @lru_cache
 def get_settings() -> Settings:

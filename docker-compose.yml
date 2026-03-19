@@ -1,0 +1,62 @@
+# docker-compose.yml
+#
+# Three services:
+#   postgres  — PostgreSQL 16 with pgvector extension
+#   redis     — Redis 7 for job queue
+#   adminer   — lightweight DB UI (dev only, to be removed in prod)
+#
+# Start everything:  docker-compose up -d
+# Stop everything:   docker-compose down
+# Wipe all data:     docker-compose down -v  (deletes volumes)
+# View logs:         docker-compose logs -f postgres
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cognidiff_postgres
+    environment:
+      POSTGRES_DB:       cognidiff
+      POSTGRES_USER:     cogniuser
+      POSTGRES_PASSWORD: cognipass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./app/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cogniuser -d cognidiff"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cognidiff_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    # appendonly yes = Redis persists data to disk
+    # Without this Redis is purely in-memory
+    # and loses everything on restart
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  adminer:
+    image: adminer:latest
+    #TODO: remove before deploying to production
+    container_name: cognidiff_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

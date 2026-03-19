@@ -1,0 +1,475 @@
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import DateTime, text, literal
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
+
+from app.config import get_settings
+from app.ingestion.chunker import CodeChunk
+from app.ingestion.embedder import EmbeddingResult
+
+logger = logging.getLogger(__name__)
+
+
+# ── Database engine ───────────────────────────────────────────────
+
+def get_engine():
+    settings = get_settings()
+    return create_async_engine(
+        settings.DATABASE_URL,
+        echo=False,      # set True to log all SQL — useful for debugging
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,  # verify connection is alive before using
+    )
+
+def get_session_factory(engine=None) -> async_sessionmaker:
+    if engine is None:
+        engine = get_engine()
+    return async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        # expire_on_commit=False means ORM objects stay usable
+        # after commit — important for async where we read
+        # attributes after the session closes
+    )
+
+
+# ── ORM models ────────────────────────────────────────────────────
+
+class Base(DeclarativeBase):
+    pass
+
+
+class RepositoryModel(Base):
+    __tablename__ = "repositories"
+
+    id:                  Mapped[uuid.UUID]          = mapped_column(primary_key=True, default=uuid.uuid4)
+    full_name:           Mapped[str]
+    clone_url:           Mapped[str]
+    default_branch:      Mapped[str]                = mapped_column(default="main")
+    last_indexed_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    status:              Mapped[str]                = mapped_column(default="pending")
+    active_index_run_id: Mapped[Optional[uuid.UUID]]
+    created_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True),default=lambda: datetime.now(timezone.utc))
+    updated_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True),default=lambda: datetime.now(timezone.utc))
+
+
+class IndexRunModel(Base):
+    __tablename__ = "index_runs"
+
+    id:               Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    repo_id:          Mapped[uuid.UUID]
+    commit_sha:       Mapped[str]
+    branch:           Mapped[str]       = mapped_column(default="main")
+    status:           Mapped[str]       = mapped_column(default="running")
+    embedding_model:  Mapped[str]
+    chunking_version: Mapped[str]       = mapped_column(default="1.0")
+    parser_version:   Mapped[str]
+    files_processed:  Mapped[int]       = mapped_column(default=0)
+    chunks_created:   Mapped[int]       = mapped_column(default=0)
+    chunks_deleted:   Mapped[int]       = mapped_column(default=0)
+    error_message:    Mapped[Optional[str]]
+    started_at:       Mapped[datetime]  = mapped_column(DateTime(timezone=True),default=lambda: datetime.now(timezone.utc))
+    completed_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+
+
+class CodeChunkModel(Base):
+    __tablename__ = "code_chunks"
+
+    id:           Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    repo_id:      Mapped[uuid.UUID]
+    index_run_id: Mapped[uuid.UUID]
+    file_path:    Mapped[str]
+    chunk_type:   Mapped[str]
+    name:         Mapped[str]
+    parent_class: Mapped[str]       = mapped_column(default="")
+    language:     Mapped[str]
+    content:      Mapped[str]
+    content_hash: Mapped[str]
+    line_start:   Mapped[Optional[int]]
+    line_end:     Mapped[Optional[int]]
+    embedding:    Mapped[Optional[list[float]]] = mapped_column(Vector(768))
+    created_at:   Mapped[datetime]  = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+# ── Store ─────────────────────────────────────────────────────────
+
+class CodeStore:
+
+    def __init__(self):
+        self.settings        = get_settings()
+        self.engine          = get_engine()
+        self.session_factory = get_session_factory(self.engine)
+
+    # ── Repository operations ─────────────────────────────────────
+
+    async def get_or_create_repository(
+        self,
+        full_name:      str,
+        clone_url:      str,
+        default_branch: str = "main",
+    ) -> RepositoryModel:
+        """
+        Returns existing repo row or creates a new one.
+        Idempotent — safe to call multiple times.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("SELECT * FROM repositories WHERE full_name = :name"),
+                {"name": full_name},
+            )
+            row = result.mappings().first()
+
+            if row:
+                return RepositoryModel(**row)
+
+            repo = RepositoryModel(
+                full_name      = full_name,
+                clone_url      = clone_url,
+                default_branch = default_branch,
+                status         = "pending",
+            )
+            session.add(repo)
+            await session.commit()
+            logger.info(f"created repository record: {full_name}")
+            return repo
+
+    async def update_repository_status(
+        self,
+        repo_id: uuid.UUID,
+        status:  str,
+    ) -> None:
+        async with self.session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE repositories
+                    SET status = :status, updated_at = NOW()
+                    WHERE id = :id
+                """),
+                {"status": status, "id": repo_id},
+            )
+            await session.commit()
+
+    async def set_active_index_run(
+        self,
+        repo_id:      uuid.UUID,
+        index_run_id: uuid.UUID,
+    ) -> None:
+        """
+        Points the repository at the newly completed index run.
+        All RAG queries scope to this run from this point on.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE repositories
+                    SET active_index_run_id = :run_id,
+                        last_indexed_at     = NOW(),
+                        status              = 'indexed',
+                        updated_at          = NOW()
+                    WHERE id = :repo_id
+                """),
+                {"run_id": index_run_id, "repo_id": repo_id},
+            )
+            await session.commit()
+            logger.info(
+                f"repo {repo_id} now pointing at "
+                f"index run {index_run_id}"
+            )
+
+    # ── Index run operations ──────────────────────────────────────
+
+    async def create_index_run(
+        self,
+        repo_id:    uuid.UUID,
+        commit_sha: str,
+        branch:     str,
+    ) -> IndexRunModel:
+        async with self.session_factory() as session:
+            run = IndexRunModel(
+                repo_id          = repo_id,
+                commit_sha       = commit_sha,
+                branch           = branch,
+                status           = "running",
+                embedding_model  = self.settings.active_embedding_model,
+                chunking_version = self.settings.CHUNKING_VERSION,
+                parser_version   = self.settings.parser_version,
+            )
+            session.add(run)
+            await session.commit()
+            logger.info(
+                f"created index run {run.id} "
+                f"for repo {repo_id} at {commit_sha[:8]}"
+            )
+            return run
+
+    async def complete_index_run(
+        self,
+        run_id:          uuid.UUID,
+        chunks_created:  int,
+        files_processed: int,
+    ) -> None:
+        async with self.session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE index_runs
+                    SET status          = 'completed',
+                        completed_at    = NOW(),
+                        chunks_created  = :chunks_created,
+                        files_processed = :files_processed
+                    WHERE id = :id
+                """),
+                {
+                    "id":              run_id,
+                    "chunks_created":  chunks_created,
+                    "files_processed": files_processed,
+                },
+            )
+            await session.commit()
+
+    async def fail_index_run(
+        self,
+        run_id:  uuid.UUID,
+        error:   str,
+    ) -> None:
+        """
+        Marks a run as failed. The previous completed run
+        remains active — no degradation to RAG quality.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE index_runs
+                    SET status        = 'failed',
+                        completed_at  = NOW(),
+                        error_message = :error
+                    WHERE id = :id
+                """),
+                {"id": run_id, "error": error},
+            )
+            await session.commit()
+            logger.error(f"index run {run_id} failed: {error}")
+
+    async def supersede_previous_runs(
+        self,
+        repo_id:         uuid.UUID,
+        current_run_id:  uuid.UUID,
+    ) -> None:
+        """
+        Marks all previously completed runs for this repo
+        as superseded. Called after a new run completes.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE index_runs
+                    SET status = 'superseded'
+                    WHERE repo_id = :repo_id
+                      AND id      != :current_id
+                      AND status  = 'completed'
+                """),
+                {"repo_id": repo_id, "current_id": current_run_id},
+            )
+            await session.commit()
+
+    # ── Chunk operations ──────────────────────────────────────────
+
+    async def bulk_insert_chunks(
+        self,
+        results:      list[EmbeddingResult],
+        repo_id:      uuid.UUID,
+        index_run_id: uuid.UUID,
+    ) -> tuple[int, int]:
+        """
+        Bulk inserts all successfully embedded chunks.
+        Skips duplicates via ON CONFLICT DO NOTHING —
+        safe for retries within the same run.
+
+        Returns (inserted_count, skipped_count).
+        """
+        successful = [r for r in results if r.success]
+        failed     = [r for r in results if not r.success]
+
+        if failed:
+            logger.warning(
+                f"{len(failed)} chunks had no embedding "
+                f"and will be stored without vector"
+            )
+
+        if not successful:
+            return 0, len(results)
+
+        rows = [
+            {
+                "id":           str(uuid.uuid4()),
+                "repo_id":      str(repo_id),
+                "index_run_id": str(index_run_id),
+                "file_path":    r.chunk.file_path,
+                "chunk_type":   r.chunk.chunk_type,
+                "name":         r.chunk.name,
+                "parent_class": r.chunk.parent_class,
+                "language":     r.chunk.language,
+                "content":      r.chunk.content,
+                "content_hash": r.chunk.content_hash,
+                "line_start":   r.chunk.line_start,
+                "line_end":     r.chunk.line_end,
+                "embedding":    r.embedding,
+            }
+            for r in successful
+        ]
+
+        # insert in batches of 500 to avoid hitting
+        # PostgreSQL's parameter limit per statement
+        inserted = 0
+        for i in range(0, len(rows), 500):
+            batch = rows[i : i + 500]
+            result = await self._insert_chunk_batch(batch)
+            inserted += result
+
+        skipped = len(successful) - inserted
+        logger.info(
+            f"chunks: {inserted} inserted, "
+            f"{skipped} skipped (duplicates), "
+            f"{len(failed)} had no embedding"
+        )
+        return inserted, skipped
+
+    async def _insert_chunk_batch(self, rows: list[dict]) -> int:
+        """
+        True bulk insert using pgvector's SQLAlchemy integration.
+        One round trip per batch regardless of row count.
+        """
+        if not rows:
+            return 0
+
+        async with self.session_factory() as session:
+            # Build insert using SQLAlchemy core — it handles
+            # type mapping correctly for asyncpg without
+            # mixing named and positional param styles
+            from sqlalchemy.dialects.postgresql import insert
+            import uuid as uuid_module
+
+            # Convert string UUIDs back to UUID objects
+            # SQLAlchemy maps these to the correct PostgreSQL types
+            typed_rows = []
+            for row in rows:
+                typed_rows.append({
+                    "id":           uuid_module.UUID(row["id"]),
+                    "repo_id":      uuid_module.UUID(row["repo_id"]),
+                    "index_run_id": uuid_module.UUID(row["index_run_id"]),
+                    "file_path":    row["file_path"],
+                    "chunk_type":   row["chunk_type"],
+                    "name":         row["name"],
+                    "parent_class": row["parent_class"],
+                    "language":     row["language"],
+                    "content":      row["content"],
+                    "content_hash": row["content_hash"],
+                    "line_start":   row["line_start"],
+                    "line_end":     row["line_end"],
+                    "embedding":    row["embedding"],
+                })
+
+            stmt = (
+                insert(CodeChunkModel)
+                .values(typed_rows)
+                .on_conflict_do_nothing(
+                    index_elements=["index_run_id", "file_path", "content_hash"]
+                )
+            )
+
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount
+
+    # ── Retrieval operations ──────────────────────────────────────
+
+    async def similarity_search(
+        self,
+        query_embedding: list[float],
+        repo_id:         uuid.UUID,
+        top_k:           int   = 10,
+        min_score:       float = 0.70,
+        language:        Optional[str] = None,
+        chunk_type:      Optional[str] = None,
+    ) -> list[dict]:
+        from sqlalchemy import select, cast
+        from pgvector.sqlalchemy import Vector
+
+        async with self.session_factory() as session:
+            # get active run
+            run_result = await session.execute(
+                text("""
+                    SELECT active_index_run_id
+                    FROM repositories
+                    WHERE id = CAST(:repo_id AS uuid)
+                """),
+                {"repo_id": str(repo_id)},
+            )
+            row = run_result.mappings().first()
+
+            if not row or not row["active_index_run_id"]:
+                logger.warning(f"repo {repo_id} has no active index run")
+                return []
+
+            active_run_id   = row["active_index_run_id"]
+            query_vector    = cast(query_embedding, Vector(768))
+
+            # cosine similarity expressed via SQLAlchemy operators
+            similarity_expr = (
+                literal(1.0) - CodeChunkModel.embedding.op("<=>")(query_vector)
+            ).label("similarity")
+
+            stmt = (
+                select(
+                    CodeChunkModel.id,
+                    CodeChunkModel.file_path,
+                    CodeChunkModel.chunk_type,
+                    CodeChunkModel.name,
+                    CodeChunkModel.parent_class,
+                    CodeChunkModel.language,
+                    CodeChunkModel.content,
+                    CodeChunkModel.line_start,
+                    CodeChunkModel.line_end,
+                    similarity_expr,
+                )
+                .where(CodeChunkModel.index_run_id == active_run_id)
+                .where(similarity_expr >= min_score)
+                .order_by(
+                    CodeChunkModel.embedding.op("<=>")(query_vector)
+                )
+                .limit(top_k)
+            )
+
+            if language:
+                stmt = stmt.where(CodeChunkModel.language == language)
+            if chunk_type:
+                stmt = stmt.where(CodeChunkModel.chunk_type == chunk_type)
+
+            result  = await session.execute(stmt)
+            rows    = result.mappings().all()
+            return [dict(r) for r in rows]
+
+    async def get_repo_by_name(
+        self,
+        full_name: str,
+    ) -> Optional[dict]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT * FROM repositories
+                    WHERE full_name = :name
+                """),
+                {"name": full_name},
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
