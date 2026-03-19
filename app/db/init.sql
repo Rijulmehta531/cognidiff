@@ -1,12 +1,8 @@
--- app/db/init.sql
-
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 
 -- ── Repositories ──────────────────────────────────────────────────
--- active_index_run_id added after index_runs via ALTER TABLE
--- to avoid circular FK. See bottom of file.
 CREATE TABLE IF NOT EXISTS repositories (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     full_name       TEXT NOT NULL UNIQUE,
@@ -42,8 +38,6 @@ CREATE TABLE IF NOT EXISTS index_runs (
     completed_at     TIMESTAMPTZ
 );
 
-
--- breaks circular FK with index_runs
 ALTER TABLE repositories
     ADD COLUMN IF NOT EXISTS active_index_run_id
     UUID REFERENCES index_runs(id) ON DELETE SET NULL;
@@ -143,11 +137,6 @@ SELECT DISTINCT ON (repo_id, pr_number)
 FROM pr_reviews
 ORDER BY repo_id, pr_number, created_at DESC;
 
-
--- active chunk count not stored as a column — would
--- overcount across multiple runs. query it directly:
---   SELECT COUNT(*) FROM code_chunks
---   WHERE index_run_id = repositories.active_index_run_id
 CREATE OR REPLACE VIEW pr_review_progress AS
 WITH first_runs AS (
     SELECT DISTINCT ON (repo_id, pr_number)

@@ -1,4 +1,3 @@
-# app/config.py
 from enum import Enum
 from functools import lru_cache
 
@@ -26,7 +25,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,   # LLM_PROVIDER and llm_provider both work
+        case_sensitive=False,
         extra="ignore",         # ignore unknown env vars instead of crashing
     )
 
@@ -112,13 +111,9 @@ def get_settings() -> Settings:
     """
     Returns a cached Settings instance.
 
-    @lru_cache means this function runs ONCE — the Settings object
+    @lru_cache - this function runs ONCE — the Settings object
     is created on first call and reused forever after.
 
-    Why cache it?
-    - Reading .env from disk on every request is wasteful
-    - Settings don't change while the app is running
-    - Every file that calls get_settings() gets the SAME object
     """
     return Settings()
 
@@ -159,8 +154,7 @@ def get_llm():
 def get_embedder():
     """
     Returns the correct embedding model based on LLM_PROVIDER.
-    Embeddings and LLM always use the same provider —
-    you don't want to mix embedding spaces between providers.
+    Embeddings and LLM always use the same provider
     """
     settings = get_settings()
 

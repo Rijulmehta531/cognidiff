@@ -1,8 +1,6 @@
-import uuid
 import pytest
 
-from app.ingestion.chunker import ASTChunker
-from app.ingestion.embedder import Embedder, EmbeddingResult
+from app.ingestion.embedder import EmbeddingResult
 from app.ingestion.chunker import CodeChunk
 from app.ingestion.cloner import compute_content_hash
 from app.retrieval.store import CodeStore

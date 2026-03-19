@@ -1,10 +1,7 @@
 import textwrap
-from pathlib import Path
-
 import pytest
 
-from app.ingestion.chunker import ASTChunker, CodeChunk
-
+from app.ingestion.chunker import ASTChunker
 
 @pytest.fixture
 def chunker():
