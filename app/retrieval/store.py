@@ -4,13 +4,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, text, literal
+from sqlalchemy import DateTime, text, literal, select, cast
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
+from sqlalchemy.dialects.postgresql import insert
 
 from app.config import get_settings
 from app.ingestion.chunker import CodeChunk
@@ -353,20 +354,12 @@ class CodeStore:
             return 0
 
         async with self.session_factory() as session:
-            # Build insert using SQLAlchemy core — it handles
-            # type mapping correctly for asyncpg without
-            # mixing named and positional param styles
-            from sqlalchemy.dialects.postgresql import insert
-            import uuid as uuid_module
-
-            # Convert string UUIDs back to UUID objects
-            # SQLAlchemy maps these to the correct PostgreSQL types
             typed_rows = []
             for row in rows:
                 typed_rows.append({
-                    "id":           uuid_module.UUID(row["id"]),
-                    "repo_id":      uuid_module.UUID(row["repo_id"]),
-                    "index_run_id": uuid_module.UUID(row["index_run_id"]),
+                    "id":           uuid.UUID(row["id"]),
+                    "repo_id":      uuid.UUID(row["repo_id"]),
+                    "index_run_id": uuid.UUID(row["index_run_id"]),
                     "file_path":    row["file_path"],
                     "chunk_type":   row["chunk_type"],
                     "name":         row["name"],
@@ -402,8 +395,6 @@ class CodeStore:
         language:        Optional[str] = None,
         chunk_type:      Optional[str] = None,
     ) -> list[dict]:
-        from sqlalchemy import select, cast
-        from pgvector.sqlalchemy import Vector
 
         async with self.session_factory() as session:
             # get active run
@@ -458,6 +449,125 @@ class CodeStore:
             result  = await session.execute(stmt)
             rows    = result.mappings().all()
             return [dict(r) for r in rows]
+
+    async def get_existing_chunks(
+        self,
+        repo_id: uuid.UUID,
+    ) -> dict[str, dict]:
+        """
+        Returns all chunks from the current active index run as a dict (key is content_hash).
+
+        Used to determine which chunks are unchanged and can be copied forward instead of re-embedded.
+
+        Returns empty dict if no active run exists (first-time index).
+        """
+        async with self.session_factory() as session:
+
+            # get active run id
+            result = await session.execute(
+                text("""
+                    SELECT active_index_run_id
+                    FROM repositories
+                    WHERE id = CAST(:repo_id AS uuid)
+                """),
+                {"repo_id": str(repo_id)},
+            )
+            row = result.mappings().first()
+
+            if not row or not row["active_index_run_id"]:
+                logger.info(
+                    f"repo {repo_id} has no active index run — "
+                    f"first time indexing, all chunks are new"
+                )
+                return {}
+
+            active_run_id = row["active_index_run_id"]
+
+            # fetch all chunks for the active run
+            result = await session.execute(
+                text("""
+                    SELECT
+                        id,
+                        file_path,
+                        chunk_type,
+                        name,
+                        parent_class,
+                        language,
+                        content,
+                        content_hash,
+                        line_start,
+                        line_end,
+                        embedding
+                    FROM code_chunks
+                    WHERE index_run_id = CAST(:run_id AS uuid)
+                """),
+                {"run_id": str(active_run_id)},
+            )
+            rows = result.mappings().all()
+
+            chunks_by_hash = {row["content_hash"]: dict(row) for row in rows}
+
+            logger.info(
+                f"found {len(chunks_by_hash)} existing chunks "
+                f"in active run {active_run_id} for repo {repo_id}"
+            )
+            return chunks_by_hash
+
+    async def copy_chunks_forward(
+        self,
+        chunk_rows:      list[dict],
+        repo_id:         uuid.UUID,
+        new_index_run_id: uuid.UUID,
+    ) -> int:
+        """
+        Copies existing chunk rows into a new index run. Assigns fresh UUIDs and the new index_run_id —
+        everything else is preserved.
+
+        Returns count of rows copied.
+        """
+        if not chunk_rows:
+            return 0
+
+        typed_rows = [
+            {
+                "id":           uuid.uuid4(),
+                "repo_id":      repo_id,
+                "index_run_id": new_index_run_id,
+                "file_path":    row["file_path"],
+                "chunk_type":   row["chunk_type"],
+                "name":         row["name"],
+                "parent_class": row["parent_class"],
+                "language":     row["language"],
+                "content":      row["content"],
+                "content_hash": row["content_hash"],
+                "line_start":   row["line_start"],
+                "line_end":     row["line_end"],
+                "embedding":    row["embedding"],
+            }
+            for row in chunk_rows
+        ]
+
+        # insert in batches of 500 — same pattern as bulk_insert_chunks
+        copied = 0
+        for i in range(0, len(typed_rows), 500):
+            batch = typed_rows[i : i + 500]
+            async with self.session_factory() as session:
+                stmt = (
+                    insert(CodeChunkModel)
+                    .values(batch)
+                    .on_conflict_do_nothing(
+                        index_elements=["index_run_id", "file_path", "content_hash"]
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                copied += result.rowcount
+
+        logger.info(
+            f"copied {copied} unchanged chunks forward "
+            f"into index run {new_index_run_id}"
+        )
+        return copied
 
     async def get_repo_by_name(
         self,
