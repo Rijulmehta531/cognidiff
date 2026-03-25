@@ -34,9 +34,9 @@ async def test_download_public_repo():
 
 
 def test_compute_content_hash():
-    h1 = compute_content_hash("def foo(): pass")
-    h2 = compute_content_hash("def foo(): pass")
-    h3 = compute_content_hash("def bar(): pass")
+    h1 = compute_content_hash("def foo(): pass", "foo.py")
+    h2 = compute_content_hash("def foo(): pass", "foo.py")
+    h3 = compute_content_hash("def bar(): pass", "bar.py")
 
     assert h1 == h2
     assert h1 != h3

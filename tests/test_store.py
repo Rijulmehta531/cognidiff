@@ -41,7 +41,7 @@ def sample_chunks():
             language     = "py",
             content      = "def validate_token(token):\n    return True",
             content_hash = compute_content_hash(
-                "def validate_token(token):\n    return True"
+                "def validate_token(token):\n    return True", "src/auth.py"
             ),
             line_start   = 1,
             line_end     = 2,
@@ -54,7 +54,7 @@ def sample_chunks():
             language     = "py",
             content      = "def process_payment(amount):\n    pass",
             content_hash = compute_content_hash(
-                "def process_payment(amount):\n    pass"
+                "def process_payment(amount):\n    pass", "src/payments.py"
             ),
             line_start   = 1,
             line_end     = 2,
@@ -225,3 +225,184 @@ async def test_similarity_search_returns_results(
     assert "file_path"  in results[0]
     assert "content"    in results[0]
     assert "similarity" in results[0]
+
+# ── get_existing_chunks tests ─────────────────────────────────────
+
+async def test_get_existing_chunks_no_active_run(store, sample_repo_data):
+    """First time indexing — no active run yet, should return empty dict."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+    result = await store.get_existing_chunks(repo_id=repo.id)
+    assert result == {}
+
+async def test_get_existing_chunks_returns_dict_keyed_by_hash(
+    store, sample_repo_data, sample_embedding_results
+):
+    """Should return all chunks from active run keyed by content_hash."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+    run  = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "existingchunkstest",
+        branch     = "main",
+    )
+    await store.bulk_insert_chunks(
+        results      = sample_embedding_results,
+        repo_id      = repo.id,
+        index_run_id = run.id,
+    )
+    await store.complete_index_run(run.id, 2, 2)
+    await store.set_active_index_run(repo.id, run.id)
+
+    result = await store.get_existing_chunks(repo_id=repo.id)
+
+    assert len(result) == 2
+    # keys should be content_hashes
+    for chunk_result in sample_embedding_results:
+        assert chunk_result.chunk.content_hash in result
+
+    # each value should have the fields pipeline needs
+    first = next(iter(result.values()))
+    assert "file_path"    in first
+    assert "content_hash" in first
+    assert "embedding"    in first 
+
+async def test_get_existing_chunks_only_returns_active_run_chunks(
+    store, sample_repo_data, sample_embedding_results
+):
+    """Should only return chunks from the active run, not superseded ones."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+
+    # first run — will be superseded
+    run1 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "firstrun",
+        branch     = "main",
+    )
+    await store.bulk_insert_chunks(
+        results      = sample_embedding_results,
+        repo_id      = repo.id,
+        index_run_id = run1.id,
+    )
+    await store.complete_index_run(run1.id, 2, 2)
+    await store.set_active_index_run(repo.id, run1.id)
+ 
+    # second run — becomes active, supersedes first
+    run2 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "secondrun",
+        branch     = "main",
+    )
+    await store.complete_index_run(run2.id, 0, 0)
+    await store.set_active_index_run(repo.id, run2.id)
+    await store.supersede_previous_runs(repo.id, run2.id)
+
+    # active run (run2) has no chunks — should return empty
+    result = await store.get_existing_chunks(repo_id=repo.id)
+    assert result == {}
+
+
+# ── copy_chunks_forward tests ─────────────────────────────────────
+
+async def test_copy_chunks_forward_empty_list(store, sample_repo_data):
+    """Empty input should return 0 without errors."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+    run  = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "copyempty",
+        branch     = "main",
+    )
+    copied = await store.copy_chunks_forward(
+        chunk_rows       = [],
+        repo_id          = repo.id,
+        new_index_run_id = run.id,
+    )
+    assert copied == 0
+
+
+async def test_copy_chunks_forward_copies_with_new_run_id(
+    store, sample_repo_data, sample_embedding_results
+):
+    """Copied chunks should belong to the new run, not the original."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+ 
+    # set up original run with chunks
+    run1 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "originalrun",
+        branch     = "main",
+    )
+    await store.bulk_insert_chunks(
+        results      = sample_embedding_results,
+        repo_id      = repo.id,
+        index_run_id = run1.id,
+    )
+    await store.complete_index_run(run1.id, 2, 2)
+    await store.set_active_index_run(repo.id, run1.id)
+ 
+    # get chunks to copy forward
+    existing = await store.get_existing_chunks(repo_id=repo.id)
+ 
+    # new run to copy into
+    run2 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "newrun",
+        branch     = "main",
+    )
+    copied = await store.copy_chunks_forward(
+        chunk_rows       = list(existing.values()),
+        repo_id          = repo.id,
+        new_index_run_id = run2.id,
+    )
+    assert copied == 2
+ 
+    # confirm chunks exist under new run id
+    async with store.session_factory() as session:
+        from sqlalchemy import text
+        result = await session.execute(
+            text("""
+                SELECT COUNT(*) as count
+                FROM code_chunks
+                WHERE index_run_id = CAST(:run_id AS uuid)
+            """),
+            {"run_id": str(run2.id)},
+        )
+        row = result.mappings().first()
+        assert row["count"] == 2
+
+
+async def test_copy_chunks_forward_is_idempotent(
+    store, sample_repo_data, sample_embedding_results
+):
+    """Copying same chunks twice should not create duplicates."""
+    repo = await store.get_or_create_repository(**sample_repo_data)
+    run1 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "sourcerun",
+        branch     = "main",
+    )
+    await store.bulk_insert_chunks(
+        results      = sample_embedding_results,
+        repo_id      = repo.id,
+        index_run_id = run1.id,
+    )
+    await store.complete_index_run(run1.id, 2, 2)
+    await store.set_active_index_run(repo.id, run1.id)
+
+    existing = await store.get_existing_chunks(repo_id=repo.id)
+
+    run2 = await store.create_index_run(
+        repo_id    = repo.id,
+        commit_sha = "destrun",
+        branch     = "main",
+    )
+    await store.copy_chunks_forward(
+        chunk_rows       = list(existing.values()),
+        repo_id          = repo.id,
+        new_index_run_id = run2.id,
+    )
+    # second copy — should skip duplicates
+    copied = await store.copy_chunks_forward(
+        chunk_rows       = list(existing.values()),
+        repo_id          = repo.id,
+        new_index_run_id = run2.id,
+    )
+    assert copied == 0

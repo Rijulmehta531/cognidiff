@@ -505,7 +505,19 @@ class CodeStore:
             )
             rows = result.mappings().all()
 
-            chunks_by_hash = {row["content_hash"]: dict(row) for row in rows}
+            chunks_by_hash = {}
+            for row in rows:
+                row_dict = dict(row)
+
+                embedding = row_dict.get("embedding")
+                if isinstance(embedding, str):
+                    row_dict["embedding"] = [
+                        float(x) for x in embedding.strip("[]").split(",") if x.strip()
+                    ]
+                elif embedding is not None:
+                    row_dict["embedding"] = [float(x) for x in embedding]
+
+                chunks_by_hash[row_dict["content_hash"]] = row_dict
 
             logger.info(
                 f"found {len(chunks_by_hash)} existing chunks "

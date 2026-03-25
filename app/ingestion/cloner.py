@@ -7,6 +7,9 @@ from pathlib import Path
 
 import aiofiles
 import httpx
+import shutil
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ async def download_repo(
         yield repo_path
 
     finally:
-        # guaranteed cleanup — runs even if caller raises
+        # guaranteed cleanup — even if caller raises
         _cleanup(tmpdir)
         logger.info(f"cleaned up {tmpdir}")
 
@@ -56,7 +59,6 @@ async def _download_and_extract(
     Downloads the tarball and returns the path to the
     extracted repo root directory.
     """
-    from app.config import get_settings
     settings = get_settings()
 
     url     = f"{GITHUB_API}/repos/{full_name}/tarball/{ref}"
@@ -70,7 +72,7 @@ async def _download_and_extract(
 
     async with httpx.AsyncClient(
         follow_redirects=True,   # GitHub redirects to S3 for the actual file
-        timeout=120.0,           # large repos can be slow
+        timeout=120.0,           # to accommodate large repos and slow connections
     ) as client:
         logger.info(f"downloading {full_name}@{ref}")
         await _stream_download(client, url, headers, tarball_path)
@@ -78,7 +80,7 @@ async def _download_and_extract(
     logger.info(f"extracting {tarball_path}")
     repo_root = _extract_tarball(tarball_path, dest)
 
-    # delete the archive — we only need the extracted files
+    # delete the tarball to save space — we only need the extracted files
     tarball_path.unlink()
 
     return repo_root
@@ -123,8 +125,7 @@ def _extract_tarball(tarball_path: Path, dest: Path) -> Path:
     We return that directory as the repo root.
     """
     with tarfile.open(tarball_path, "r:gz") as tar:
-        # GitHub tarballs are safe but we filter anyway —
-        # guards against path traversal in malicious archives
+        # GitHub tarballs are safe but we filter anyway to guard against path traversal in malicious archives
         members = [
             m for m in tar.getmembers()
             if not _is_unsafe_path(m.name)
@@ -155,7 +156,6 @@ async def get_commit_sha(
     Call this before download_repo so the index_run
     has the exact commit that was indexed.
     """
-    from app.config import get_settings
     settings = get_settings()
 
     url     = f"{GITHUB_API}/repos/{full_name}/commits/{ref}"
@@ -169,7 +169,7 @@ async def get_commit_sha(
         response = await client.get(url, headers=headers)
         response.raise_for_status()
         return response.json()["sha"]
-    
+
 def _is_unsafe_path(name: str) -> bool:
     """
     Guards against path traversal attacks in tarballs.
@@ -186,17 +186,16 @@ def _cleanup(path: Path) -> None:
     if not path.exists():
         return
     try:
-        import shutil
         shutil.rmtree(path)
     except Exception as e:
         # log but don't raise — cleanup failure is not fatal
         logger.warning(f"cleanup failed for {path}: {e}")
 
 
-def compute_content_hash(content: str) -> str:
+def compute_content_hash(content: str, filename: str) -> str:
     """
-    SHA-256 hash of a chunk's content.
+    SHA-256 hash of a chunk's content and filename.
     Used for idempotency — if this hash matches an existing
     chunk in the current run, we skip re-embedding it.
     """
-    return hashlib.sha256(content.encode()).hexdigest()
+    return hashlib.sha256(f"{content}{filename}".encode()).hexdigest()

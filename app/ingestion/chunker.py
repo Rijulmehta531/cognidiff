@@ -237,7 +237,7 @@ class ASTChunker:
                 parent_class = parent_cls,
                 language     = language,
                 content      = content,
-                content_hash = compute_content_hash(content),
+                content_hash = compute_content_hash(content, rel_path),
                 line_start   = line_start,
                 line_end     = line_end,
                 metadata     = self._build_metadata(
@@ -286,7 +286,7 @@ class ASTChunker:
             parent_class = "",
             language     = language,
             content      = source,
-            content_hash = compute_content_hash(source),
+            content_hash = compute_content_hash(source, rel_path),
             line_start   = 1,
             line_end     = line_count,
             metadata     = {
