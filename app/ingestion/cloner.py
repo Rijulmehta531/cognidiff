@@ -10,6 +10,12 @@ import httpx
 import shutil
 
 from app.config import get_settings
+from app.exceptions import (
+    AuthenticationError,
+    GitHubRateLimitError,
+    GitHubUnavailableError,
+    RepoNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,34 @@ async def _download_and_extract(
 
     return repo_root
 
+def _raise_for_github_status(response: httpx.Response) -> None:
+    """
+    Maps GitHub HTTP error codes to typed exceptions.
+    Purpose: callers get specific, actionable exception types
+    rather than a generic httpx.HTTPStatusError.
+    """
+    if response.status_code == 401:
+        raise AuthenticationError(
+            f"invalid or expired GitHub token "
+            f"(HTTP 401 for {response.url})"
+        )
+    if response.status_code == 404:
+        raise RepoNotFoundError(
+            f"repo not found or token lacks access "
+            f"(HTTP 404 for {response.url})"
+        )
+    if response.status_code == 429:
+        raise GitHubRateLimitError(
+            f"GitHub API rate limit exceeded "
+            f"(HTTP 429 for {response.url})"
+        )
+    if response.status_code in (503, 504):
+        raise GitHubUnavailableError(
+            f"GitHub temporarily unavailable "
+            f"(HTTP {response.status_code} for {response.url})"
+        )
+    # fall back to httpx's default
+    response.raise_for_status()
 
 async def _stream_download(
     client:       httpx.AsyncClient,
@@ -98,7 +132,7 @@ async def _stream_download(
     important for large repos.
     """
     async with client.stream("GET", url, headers=headers) as response:
-        response.raise_for_status()
+        _raise_for_github_status(response)
 
         total    = int(response.headers.get("content-length", 0))
         received = 0
@@ -167,7 +201,7 @@ async def get_commit_sha(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(url, headers=headers)
-        response.raise_for_status()
+        _raise_for_github_status(response)
         return response.json()["sha"]
 
 def _is_unsafe_path(name: str) -> bool:
