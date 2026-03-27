@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     CHUNKING_VERSION: str = "1.0"
 
     # ── Retrieval settings ────────────────────────────────────────────────
-    RETRIEVAL_TOP_K:       int   = 10    # how many chunks to retrieve per query
+    RETRIEVAL_QUERY_TOP_K: int = 5       # how many chunks to retrieve from the vector store for each user query
+    RETRIEVAL_TOP_K:       int   = 10    # global cap on number of retrieved chunks to consider for LLM analysis
     RETRIEVAL_MIN_SCORE:   float = 0.70  # minimum similarity score (0-1)
 
     # ── Validators ────────────────────────────────────────────────────────
