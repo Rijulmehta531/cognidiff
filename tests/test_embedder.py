@@ -22,7 +22,6 @@ def sample_chunks(tmp_path):
     chunker = ASTChunker()
     return chunker.chunk_repo(tmp_path)
 
-
 async def test_embed_chunks_returns_results(embedder, sample_chunks):
     """Basic: embedding returns one result per chunk."""
     results = await embedder.embed_chunks(sample_chunks)
@@ -58,6 +57,10 @@ async def test_embed_empty_list(embedder):
     results = await embedder.embed_chunks([])
     assert results == []
 
+async def test_embed_texts_empty_input_returns_empty_list(embedder):
+    """Embedding an empty list should return an empty list."""
+    results = await embedder.embed_texts([])
+    assert results == []
 
 async def test_embedding_result_structure(embedder, sample_chunks):
     """EmbeddingResult fields are correctly populated."""
@@ -69,3 +72,18 @@ async def test_embedding_result_structure(embedder, sample_chunks):
             assert isinstance(result.embedding, list)
             assert all(isinstance(v, float) for v in result.embedding)
             assert result.error is None
+
+async def test_embed_texts_returns_one_embedding_per_text(embedder):
+    """embed_texts should return one embedding per input text."""
+    texts = ["hello world", "test embedding"]
+    embeddings = await embedder.embed_texts(texts)
+    assert len(embeddings) == len(texts)
+    for emb in embeddings:
+        assert isinstance(emb, list)
+        assert all(isinstance(v, float) for v in emb)
+
+async def test_embed_texts_raises_on_embedding_failure(embedder):
+    """If embedding fails (e.g. due to invalid input), an exception should be raised."""
+    invalid_texts = [None, 123, {"not": "a string"}]
+    with pytest.raises(Exception):
+        await embedder.embed_texts(invalid_texts)
