@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -165,7 +166,6 @@ class Embedder:
         run_in_executor offloads it to a thread so the event
         loop stays free to handle other work.
         """
-        import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
