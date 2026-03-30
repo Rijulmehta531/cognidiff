@@ -67,6 +67,28 @@ class Embedder:
         )
         return results
 
+    async def embed_texts(
+        self,
+        texts: list[str],
+    ) -> list[list[float]]:
+        """
+        Embeds raw strings directly — no CodeChunk required.
+        Used by the retriever to embed natural language queries
+        before similarity search.
+
+        Unlike embed_chunks, this raises on failure — the caller
+        (retriever) decides how to handle query embedding errors,
+        since there is no per-item fallback that makes sense for
+        a list of queries.
+        """
+        if not texts:
+            return []
+
+        logger.info(f"embedding {len(texts)} query texts")
+        embeddings = await self._run_embed(texts)
+        logger.info(f"query embedding complete — {len(embeddings)} vectors")
+        return embeddings
+
     async def _embed_batch(
         self,
         batch: list[CodeChunk],
