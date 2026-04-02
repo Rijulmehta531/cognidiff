@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
+from typing import Literal
 
+from pydantic import BaseModel, Field
 
-# ── Diff models ───────────────────────────────────────────────────
+# ── Diff models ────────────────────────────────
+# These models are written as dataclasses as they are used internally
+#  within the codebase and don't need the validation or serialization
 
 @dataclass
 class DiffHunk:
@@ -69,22 +73,38 @@ class PullRequestDiff:
 
 
 # ── Review models ─────────────────────────────────────────────────
+# These are LLM output models — passed directly to
+# llm.with_structured_output() which requires a Pydantic schema
+# to generate the JSON schema for constrained decoding.
 
-@dataclass
-class ReviewComment:
+class ReviewComment(BaseModel):
     """
     A single inline comment on a specific line of the diff.
 
     path and line together identify exactly where in the PR
     the comment should appear.
     """
-    path: str    # file path relative to repo root
-    line: int    # line number in the diff (not the file)
-    body: str    # comment text
+    path: str = Field(
+        description=(
+            "File path relative to the repo root, "
+            "e.g. 'src/auth/validator.py'"
+        )
+    )
+    line: int = Field(
+        description=(
+            "Line number in the diff where the comment should appear. "
+            "Must be a line visible in the diff, not an arbitrary file line."
+        )
+    )
+    body: str = Field(
+        description=(
+            "The comment text. Be precise and actionable — "
+            "explain what the issue is and how to fix it."
+        )
+    )
 
 
-@dataclass
-class PullRequestReview:
+class PullRequestReview(BaseModel):
     """
     The complete review the agent posts back to GitHub.
 
@@ -93,6 +113,28 @@ class PullRequestReview:
       REQUEST_CHANGES  — agent found issues that must be addressed
       COMMENT          — agent has observations but no strong verdict
     """
-    body:     str
-    event:    str                        # APPROVE | REQUEST_CHANGES | COMMENT
-    comments: list[ReviewComment] = field(default_factory=list)
+    body: str = Field(
+        description=(
+            "The overall review summary shown at the top of the GitHub "
+            "review. Should cover: what the PR does, key findings, "
+            "and the reasoning behind the review decision. "
+            "If codebase context was unavailable during retrieval, "
+            "note that the review is based on the diff alone."
+        )
+    )
+    event: Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"] = Field(
+        description=(
+            "The review decision. Use APPROVE if no significant issues "
+            "were found. Use REQUEST_CHANGES if issues must be addressed "
+            "before merge. Use COMMENT for observations without a "
+            "blocking verdict."
+        )
+    )
+    comments: list[ReviewComment] = Field(
+        default_factory=list,
+        description=(
+            "Inline comments on specific diff lines. Only include comments "
+            "where you have something precise and actionable to say. "
+            "Prefer fewer high-quality comments over many shallow ones."
+        )
+    )
