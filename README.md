@@ -16,19 +16,19 @@ The codebase index is built separately, triggered on every push to your default 
 
 Some key decisions I was deliberate about, worth knowing before you read the code
 
-### AST-aware chunking
+### 1. AST-aware chunking
 
 Most RAG pipelines split code by character count. This one uses tree-sitter to parse the actual syntax tree and extract complete units - functions, methods, classes = as individual chunks.
 
 A line-based split can cut a function in half. The embedding then represents neither its intent nor its structure, which makes retrieval noisy. AST chunking guarantees every chunk is a complete, meaningful unit.
 
-### Incremental re-embedding
+### 2. Incremental re-embedding
 
 Every chunk is hashed from its content and file path. On re-index, unchanged chunks are copied forward - they're never re-embedded. Only genuinely modified code hits the embedding model.
 
 The file path is included in the hash deliberately. A function that moves files produces a different hash even if the body is identical - the file context changed.
 
-### Transient vs permanent failures
+### 3. Transient vs permanent failures
 
 The exception hierarchy separates failures worth retrying from ones that aren't - at the type level, not via string matching.
 
@@ -39,17 +39,17 @@ PermanentError  →  stop   (bad credentials, 404, malformed data)
 
 Blindly retrying a 401 wastes time and burns API quota. Retrying a 429 with backoff is exactly right. Retry logic only triggers on transient failures.
 
-### RAG scoping for token efficiency
+### 4. RAG scoping for token efficiency
 
 The retriever runs one query per changed file, then applies two caps before anything reaches the LLM: one per query (to limit DB load) and one globally (to control prompt size). Deduplication keeps the highest similarity score when the same chunk appears in multiple queries.
 
 Similarity scores are stripped before the LLM sees the context. They're internal routing signals - exposing them risks the model over-weighting a 0.97 chunk vs a 0.71 one regardless of actual relevance.
 
-### Raw unified diff over the files API
+### 5. Raw unified diff over the files API
 
 GitHub exposes diffs two ways: a JSON `/files` endpoint and a raw unified diff. The files endpoint silently truncates at 300 files and drops the `patch` field for large diffs. A partial review is worse than no review - a reviewer who missed half the changes is a false signal of quality. CogniDiff uses the raw diff, which has no such limits.
 
-### Structured output via constrained decoding
+### 6. Structured output via constrained decoding
 
 The LLM produces a typed `PullRequestReview` object, not free-form text. For Ollama this uses `json_schema` mode (constrained decoding at the token level). For Azure OpenAI it uses native structured output. The interface is identical - switching providers requires no code changes.
 
