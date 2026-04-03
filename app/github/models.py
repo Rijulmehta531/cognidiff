@@ -10,12 +10,8 @@ from pydantic import BaseModel, Field
 @dataclass
 class DiffHunk:
     """
-    A single contiguous block of changes within a file.
-
-    One file can have multiple hunks — e.g. a change at line 10
-    and another at line 80 produce two separate hunks.
-    Each hunk includes a few lines of surrounding context
-    so the LLM can reason about what the change sits next to.
+    A single contiguous block of changes within a file
+    along with some surrounding context lines.
     """
     header:  str        # raw @@ -x,y +x,y @@ line
     content: str        # full hunk text including context lines
@@ -26,7 +22,7 @@ class DiffFile:
     """
     All changes to a single file within a PR.
 
-    status follows GitHub's convention:
+    status can be:
       added    — new file
       modified — existing file changed
       removed  — file deleted
