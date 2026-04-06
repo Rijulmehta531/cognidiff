@@ -20,13 +20,6 @@ async def ingest_repo(
 ) -> None:
     """
     ARQ job — runs the full ingestion pipeline for a repository.
-
-    Transient failures (network issues, rate limits, service
-    unavailability) are retried automatically up to 3 times
-    with a 30 second delay between attempts.
-
-    Permanent failures (bad token, repo not found) are logged
-    and dropped — retrying would not help.
     """
     logger.info(
         f"[worker] ingest_repo started — "
@@ -59,7 +52,7 @@ async def ingest_repo(
         raise Retry(defer=30)  # retry after 30 seconds
 
 
-# ── Worker settings ───────────────────────────────────────────────
+# Worker settings
 # entry point for ARQ to start the worker.
 # command: arq app.worker.WorkerSettings
 
@@ -86,5 +79,4 @@ class WorkerSettings:
     max_tries = 3
 
     # how long to keep job results in Redis (seconds)
-    # useful for debugging failed jobs — 1 hour
     keep_result = 3600
