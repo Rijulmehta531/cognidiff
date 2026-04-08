@@ -176,15 +176,14 @@ async def _handle_pull_request(payload: dict, arq_redis: ArqRedis) -> None:
         f"{full_name} #{pr_number} ({commit_sha[:8]})"
     )
 
-    # TODO: enqueue review_pr job once agent layer is built
-    # await arq_redis.enqueue_job(
-    #     "review_pr",
-    #     full_name,
-    #     pr_number,
-    #     pr_title,
-    #     commit_sha,
-    #     _job_id=f"review:{full_name}:{pr_number}",
-    # )
+    await arq_redis.enqueue_job(
+        "review_pr",
+        full_name,
+        pr_number,
+        pr_title,
+        commit_sha,
+        _job_id=f"review:{full_name}:{pr_number}",
+    )
 
     logger.info(
         f"[webhook] review_pr not yet implemented — "

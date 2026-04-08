@@ -595,3 +595,116 @@ class CodeStore:
             )
             row = result.mappings().first()
             return dict(row) if row else None
+
+    async def get_review_by_commit(
+        self,
+        repo_id:    uuid.UUID,
+        pr_number:  int,
+        commit_sha: str,
+    ) -> Optional[dict]:
+        """
+        Returns the existing review row for a specific commit SHA,
+        or None if this commit has not been reviewed yet.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT * FROM pr_reviews
+                    WHERE repo_id    = CAST(:repo_id AS uuid)
+                      AND pr_number  = :pr_number
+                      AND commit_sha = :commit_sha
+                    LIMIT 1
+                """),
+                {
+                    "repo_id":    str(repo_id),
+                    "pr_number":  pr_number,
+                    "commit_sha": commit_sha,
+                },
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def save_review(
+        self,
+        repo_id:       uuid.UUID,
+        pr_number:     int,
+        pr_title:      str,
+        commit_sha:    str,
+        decision:      str,
+        summary:       str,
+        comments_count: int,
+        processing_ms: Optional[int] = None,
+    ) -> None:
+        """
+        Appends a new row to pr_reviews.
+
+        append-only — never updates existing rows. Each commit SHA
+        gets its own row. review_run is computed as the count of
+        previous reviews for this PR plus one.
+
+        issues_found is set to comments_count when the decision is
+        REQUEST_CHANGES — these are the actionable problems surfaced.
+        issues_open mirrors issues_found on insert; it decreases as
+        the author addresses comments in subsequent review runs.
+        """
+        async with self.session_factory() as session:
+            # compute review_run as count of existing reviews for this PR plus one
+            count_result = await session.execute(
+                text("""
+                    SELECT COUNT(*) AS cnt FROM pr_reviews
+                    WHERE repo_id   = CAST(:repo_id AS uuid)
+                      AND pr_number = :pr_number
+                """),
+                {"repo_id": str(repo_id), "pr_number": pr_number},
+            )
+            review_run = count_result.scalar() + 1
+
+            issues_found = comments_count if decision == "REQUEST_CHANGES" else 0
+
+            await session.execute(
+                text("""
+                    INSERT INTO pr_reviews (
+                        repo_id,
+                        pr_number,
+                        pr_title,
+                        commit_sha,
+                        review_run,
+                        review_decision,
+                        review_summary,
+                        comments_count,
+                        issues_found,
+                        issues_open,
+                        processing_ms
+                    ) VALUES (
+                        CAST(:repo_id AS uuid),
+                        :pr_number,
+                        :pr_title,
+                        :commit_sha,
+                        :review_run,
+                        :review_decision,
+                        :review_summary,
+                        :comments_count,
+                        :issues_found,
+                        :issues_open,
+                        :processing_ms
+                    )
+                """),
+                {
+                    "repo_id":        str(repo_id),
+                    "pr_number":      pr_number,
+                    "pr_title":       pr_title,
+                    "commit_sha":     commit_sha,
+                    "review_run":     review_run,
+                    "review_decision": decision,
+                    "review_summary": summary,
+                    "comments_count": comments_count,
+                    "issues_found":   issues_found,
+                    "issues_open":    issues_found,
+                    "processing_ms":  processing_ms,
+                },
+            )
+            await session.commit()
+            logger.info(
+                f"saved review run {review_run} for "
+                f"{repo_id} PR#{pr_number} — {decision}"
+            )
