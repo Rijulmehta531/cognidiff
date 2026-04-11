@@ -1,12 +1,16 @@
 import logging
+import time
+import uuid
 
 from arq import cron
 from arq.connections import RedisSettings
 from arq.jobs import Retry
 
+from app.agent.graph import review_graph
 from app.config import get_settings
 from app.exceptions import TransientError, PermanentError
 from app.ingestion.pipeline import run_ingestion_pipeline
+from app.retrieval.store import CodeStore
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,88 @@ async def ingest_repo(
         )
         raise Retry(defer=30)  # retry after 30 seconds
 
+async def review_pr(
+    ctx:        dict,
+    full_name:  str,
+    pr_number:  int,
+    pr_title:   str,
+    commit_sha: str,
+) -> None:
+    prefix = f"[worker:review_pr:{full_name}#{pr_number}]"
+    logger.info(f"{prefix} started — commit {commit_sha[:8]}")
+
+    store = CodeStore()
+
+    repo = await store.get_repo_by_name(full_name)
+    if not repo:
+        raise PermanentError(
+            f"repo {full_name!r} not found in database — "
+            f"has it been indexed yet?"
+        )
+
+    repo_id = repo["id"]
+    if isinstance(repo_id, str):
+        repo_id = uuid.UUID(repo_id)
+    
+    existing = await store.get_review_by_commit(
+        repo_id    = repo_id,
+        pr_number  = pr_number,
+        commit_sha = commit_sha,
+    )
+
+    if existing:
+        logger.info(f"{prefix} already reviewed at commit {commit_sha[:8]} — skipping")
+        return
+
+    initial_state = {
+        "full_name":         full_name,
+        "pr_number":         pr_number,
+        "pr_title":          pr_title,
+        "commit_sha":        commit_sha,
+        "repo_id":           repo_id,
+        "pr_diff":           None,
+        "retrieved_context": None,
+        "retrieval_skipped": False,
+        "review":            None,
+        "error":             None,
+    }
+
+    started_at = time.monotonic()
+
+    # TransientError raised inside the graph
+    # propagates naturally — ARQ catches it and schedules a retry.
+    final_state = await review_graph.ainvoke(initial_state)
+ 
+    processing_ms = int((time.monotonic() - started_at) * 1000)
+ 
+    if final_state.get("error"):
+        logger.error(
+            f"{prefix} graph ended with error — "
+            f"{final_state['error']}"
+        )
+        return
+
+    review = final_state["review"]
+
+    await store.save_review(
+        repo_id        = repo_id,
+        pr_number      = pr_number,
+        pr_title       = pr_title,
+        commit_sha     = commit_sha,
+        decision       = review.event,
+        summary        = review.body,
+        comments_count = len(review.comments),
+        processing_ms  = processing_ms,
+    )
+
+    logger.info(
+        f"{prefix} complete — "
+        f"{review.event}, "
+        f"{len(review.comments)} inline comments, "
+        f"{processing_ms}ms"
+    )
+
+
 
 # Worker settings
 # entry point for ARQ to start the worker.
@@ -65,7 +151,7 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
 
     # job functions this worker handles
-    functions = [ingest_repo]
+    functions = [ingest_repo, review_pr]
 
     # max parallel jobs — balances throughput against
     # GitHub API rate limits and embedding service capacity
