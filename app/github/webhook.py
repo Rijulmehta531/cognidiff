@@ -155,9 +155,6 @@ async def _handle_pull_request(payload: dict, arq_redis: ArqRedis) -> None:
     Handles pull_request events.
     Triggers a review for newly opened PRs and PRs updated
     with a new commit (synchronize action).
-
-    review_pr job is not implemented yet — this is a stub
-    that will be wired up when the agent layer is built.
     """
     action     = payload["action"]
     full_name  = payload["repository"]["full_name"]

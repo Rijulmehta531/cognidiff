@@ -2,9 +2,8 @@ import logging
 import time
 import uuid
 
-from arq import cron
+from arq import Retry
 from arq.connections import RedisSettings
-from arq.jobs import Retry
 
 from app.agent.graph import review_graph
 from app.config import get_settings
@@ -53,7 +52,7 @@ async def ingest_repo(
             f"{full_name}@{ref}: {e} "
             f"(attempt {ctx['job_try']} of {ctx['job_try_count']})"
         )
-        raise Retry(defer=30)  # retry after 30 seconds
+        raise Retry(defer=30)
 
 async def review_pr(
     ctx:        dict,

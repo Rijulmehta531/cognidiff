@@ -36,7 +36,6 @@ def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
     """
-    settings = get_settings()
 
     app = FastAPI(
         title       = "CogniDiff",
